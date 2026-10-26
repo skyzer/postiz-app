@@ -26,6 +26,16 @@ import { DashboardFunction } from '@gitroom/nestjs-libraries/integrations/dashbo
 
 export const META_GRAPH_API_VERSION = 'v25.0';
 
+// A published (non-story) video that still needs its custom cover: the video
+// is already live, so the cover is best-effort and never fails the post.
+type FacebookVideoThumbnailPending = {
+  postType: 'video';
+  videoId: string;
+  thumbnail: string;
+  checks: number;
+  thumbnailAttempts: number;
+};
+
 @Rules(
   "Facebook posts can be text only, or include photos or a video. If it's a story, it must have at least one attachment (photo or video), and each media is published as a separate story. Video posts (not stories) can carry an optional title."
 )
@@ -644,16 +654,22 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
 
   override async checkPostStatus(
     accessToken: string,
-    pendingData: {
-      postType: 'story';
-      items: { kind: 'video' | 'photo'; mediaId: string }[];
-      publishedCount: number;
-      lastPostId: string;
-      attempting?: number | null;
-      confirmed?: boolean;
-    },
+    pendingData:
+      | {
+          postType: 'story';
+          items: { kind: 'video' | 'photo'; mediaId: string }[];
+          publishedCount: number;
+          lastPostId: string;
+          attempting?: number | null;
+          confirmed?: boolean;
+        }
+      | FacebookVideoThumbnailPending,
     integration: Integration
   ): Promise<PendingCheckResponse> {
+    if (pendingData.postType === 'video') {
+      return this.checkVideoThumbnailStatus(accessToken, pendingData);
+    }
+
     // A confirmed publish attempt died without reporting its result: Facebook
     // has no API to ask whether a story was published, so never publish that
     // item again - stop with an explicit warning instead.
@@ -692,16 +708,22 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
 
   override async finalizePost(
     accessToken: string,
-    pendingData: {
-      postType: 'story';
-      items: { kind: 'video' | 'photo'; mediaId: string }[];
-      publishedCount: number;
-      lastPostId: string;
-      attempting?: number | null;
-      confirmed?: boolean;
-    },
+    pendingData:
+      | {
+          postType: 'story';
+          items: { kind: 'video' | 'photo'; mediaId: string }[];
+          publishedCount: number;
+          lastPostId: string;
+          attempting?: number | null;
+          confirmed?: boolean;
+        }
+      | FacebookVideoThumbnailPending,
     integration: Integration
   ): Promise<PendingCheckResponse> {
+    if (pendingData.postType === 'video') {
+      return this.setVideoThumbnail(accessToken, pendingData);
+    }
+
     // Publish exactly one story per call, with an arm -> confirm -> publish
     // handshake: the publish only runs after checkPostStatus witnessed the
     // intent, so a run that dies mid-publish is detectable and the item is
@@ -752,6 +774,95 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
       status: 'completed',
       postId: storyPostId,
       releaseURL: `https://www.facebook.com/stories/${storyPostId}`,
+    };
+  }
+
+  // The cover can only be set once Facebook finished processing the video.
+  // Processing errors or a very slow upload just skip the cover, the video
+  // itself is already published.
+  private async checkVideoThumbnailStatus(
+    accessToken: string,
+    pendingData: FacebookVideoThumbnailPending
+  ): Promise<PendingCheckResponse> {
+    const done = {
+      status: 'completed' as const,
+      postId: pendingData.videoId,
+      releaseURL: 'https://www.facebook.com/reel/' + pendingData.videoId,
+    };
+
+    let ready = false;
+    try {
+      ready = await this.fbVideoStatus(pendingData.videoId, accessToken);
+    } catch (err) {
+      console.warn('Facebook video processing failed, skipping the cover', {
+        videoId: pendingData.videoId,
+      });
+      return done;
+    }
+
+    if (ready) {
+      return { status: 'ready', pendingData };
+    }
+
+    if (pendingData.checks >= 45) {
+      console.warn('Facebook video still processing, skipping the cover', {
+        videoId: pendingData.videoId,
+      });
+      return done;
+    }
+
+    return {
+      status: 'pending',
+      pendingData: { ...pendingData, checks: pendingData.checks + 1 },
+    };
+  }
+
+  // Setting the cover is idempotent, so a failed attempt goes back through
+  // checkPostStatus and is retried a few times before giving up with a warning.
+  private async setVideoThumbnail(
+    accessToken: string,
+    pendingData: FacebookVideoThumbnailPending
+  ): Promise<PendingCheckResponse> {
+    try {
+      const image = await this.readOrFetch(pendingData.thumbnail);
+
+      const form = new FormData();
+      form.append(
+        'source',
+        new Blob([image]),
+        pendingData.thumbnail.split('/').pop()!.split('?')[0]
+      );
+      form.append('is_preferred', 'true');
+
+      await this.fetch(
+        `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${pendingData.videoId}/thumbnails?access_token=${accessToken}`,
+        {
+          method: 'POST',
+          body: form,
+        },
+        'upload video thumbnail'
+      );
+    } catch (err) {
+      if (pendingData.thumbnailAttempts < 2) {
+        return {
+          status: 'pending',
+          pendingData: {
+            ...pendingData,
+            thumbnailAttempts: pendingData.thumbnailAttempts + 1,
+          },
+        };
+      }
+
+      console.warn('Could not set the Facebook video cover', {
+        videoId: pendingData.videoId,
+        message: (err as any)?.message,
+      });
+    }
+
+    return {
+      status: 'completed',
+      postId: pendingData.videoId,
+      releaseURL: 'https://www.facebook.com/reel/' + pendingData.videoId,
     };
   }
 
@@ -858,6 +969,24 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
           'upload mp4'
         )
       ).json();
+
+      if (firstPost?.media?.[0]?.thumbnail) {
+        return [
+          {
+            id: firstPost.id,
+            postId: '',
+            releaseURL: '',
+            status: 'pending',
+            pendingData: {
+              postType: 'video',
+              videoId,
+              thumbnail: firstPost.media[0].thumbnail,
+              checks: 0,
+              thumbnailAttempts: 0,
+            },
+          },
+        ];
+      }
 
       finalUrl = 'https://www.facebook.com/reel/' + videoId;
       finalId = videoId;
